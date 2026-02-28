@@ -107,6 +107,65 @@ describe Whatsapp::IncomingMessageWhatsappCloudService do
       end
     end
 
+    context 'when message contains referral metadata' do
+      let(:referral_data) do
+        {
+          source_url: 'https://fb.me/8y2P9F6DI',
+          source_id: '52505057758139',
+          source_type: 'ad',
+          body: 'Ad body text'
+        }
+      end
+
+      let(:referral_params) do
+        {
+          phone_number: whatsapp_channel.phone_number,
+          object: 'whatsapp_business_account',
+          entry: [{
+            changes: [{
+              value: {
+                contacts: [{ profile: { name: 'Teixeira' }, wa_id: '558694128144' }],
+                messages: [{
+                  from: '558694128144',
+                  id: 'wamid.12345',
+                  timestamp: '1772274767',
+                  text: { body: 'Olá! Tenho interesse' },
+                  type: 'text',
+                  referral: referral_data
+                }]
+              }
+            }]
+          }]
+        }.with_indifferent_access
+      end
+
+      it 'persists referral info on the created message and conversation' do
+        described_class.new(inbox: whatsapp_channel.inbox, params: referral_params).perform
+
+        message = whatsapp_channel.inbox.messages.last
+        expect(message.content_attributes['referral']).to eq(referral_data.as_json)
+
+        conversation = whatsapp_channel.inbox.conversations.last
+        expect(conversation.custom_attributes['whatsapp_referral']).to eq(referral_data.as_json)
+      end
+
+      context 'when a conversation already exists without referral data' do
+        before do
+          # set up an existing contact/conversation chain
+          contact = create(:contact, phone_number: '+558694128144', account: whatsapp_channel.account)
+          contact_inbox = create(:contact_inbox, contact: contact, inbox: whatsapp_channel.inbox, source_id: '558694128144')
+          create(:conversation, contact: contact, inbox: whatsapp_channel.inbox, contact_inbox: contact_inbox, custom_attributes: {})
+        end
+
+        it 'updates the conversation custom_attributes with referral data' do
+          described_class.new(inbox: whatsapp_channel.inbox, params: referral_params).perform
+
+          conversation = whatsapp_channel.inbox.conversations.last
+          expect(conversation.custom_attributes['whatsapp_referral']).to eq(referral_data.as_json)
+        end
+      end
+    end
+
     context 'when message is a reply (has context)' do
       let(:reply_params) do
         {
