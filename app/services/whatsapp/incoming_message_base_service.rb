@@ -181,7 +181,6 @@ class Whatsapp::IncomingMessageBaseService
   def build_content_attributes(message)
     attrs = outgoing_echo ? { external_echo: true } : {}
     attrs[:in_reply_to_external_id] = @in_reply_to_external_id if @in_reply_to_external_id.present?
-    
     # store referral details on the message as well so they are available
     attrs[:referral] = message[:referral] if message[:referral].present?
     attrs
