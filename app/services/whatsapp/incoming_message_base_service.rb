@@ -55,7 +55,7 @@ class Whatsapp::IncomingMessageBaseService
   def update_message_with_status(message, status)
     message.status = status[:status]
     if status[:status] == 'failed' && status[:errors].present?
-      error = status[:errors]&.first
+      error = status[:errors].first
       message.external_error = "#{error[:code]}: #{error[:title]}"
     end
     message.save!
@@ -87,68 +87,49 @@ class Whatsapp::IncomingMessageBaseService
   end
 
   def set_contact
-    if outgoing_echo
-      set_contact_from_echo
-    else
-      set_contact_from_message
-    end
+    outgoing_echo ? set_contact_from_echo : set_contact_from_message
   end
 
   def set_contact_from_echo
-    # For echo messages, contact phone is in the 'to' field
     phone_number = messages_data.first[:to]
-    waid = processed_waid(phone_number)
-
-    contact_inbox = ::ContactInboxWithContactBuilder.new(
-      source_id: waid,
+    @contact_inbox = ::ContactInboxWithContactBuilder.new(
+      source_id: processed_waid(phone_number),
       inbox: inbox,
       contact_attributes: { name: "+#{phone_number}", phone_number: "+#{phone_number}" }
     ).perform
-
-    @contact_inbox = contact_inbox
-    @contact = contact_inbox.contact
+    @contact = @contact_inbox.contact
   end
 
   def set_contact_from_message
     contact_params = @processed_params[:contacts]&.first
     return if contact_params.blank?
 
-    waid = processed_waid(contact_params[:wa_id])
-
-    contact_inbox = ::ContactInboxWithContactBuilder.new(
-      source_id: waid,
+    @contact_inbox = ::ContactInboxWithContactBuilder.new(
+      source_id: processed_waid(contact_params[:wa_id]),
       inbox: inbox,
-      contact_attributes: { name: contact_params.dig(:profile, :name), phone_number: "+#{messages_data.first[:from]}" }
+      contact_attributes: {
+        name: contact_params.dig(:profile, :name),
+        phone_number: "+#{messages_data.first[:from]}"
+      }
     ).perform
+    @contact = @contact_inbox.contact
 
-    @contact_inbox = contact_inbox
-    @contact = contact_inbox.contact
-
-    # Update existing contact name if ProfileName is available and current name is just phone number
     update_contact_with_profile_name(contact_params)
   end
 
   def set_conversation
-    # if lock to single conversation is disabled, we will create a new conversation if previous conversation is resolved
     @conversation = if @inbox.lock_to_single_conversation
                       @contact_inbox.conversations.last
                     else
-                      @contact_inbox.conversations
-                                    .where.not(status: :resolved).last
+                      @contact_inbox.conversations.where.not(status: :resolved).last
                     end
 
     if @conversation
-      # if referral metadata is present on the incoming message we store it
-      # on the conversation unless already persisted. this handles the case
-      # where a conversation already existed before we received a referral
-      if messages_data.first[:referral].present?
+      referral = messages_data.first[:referral]
+      if referral.present?
         attrs = @conversation.custom_attributes || {}
-        if attrs['whatsapp_referral'].blank?
-          attrs['whatsapp_referral'] = messages_data.first[:referral]
-          @conversation.update!(custom_attributes: attrs)
-        end
+        @conversation.update!(custom_attributes: attrs.merge('whatsapp_referral' => referral)) if attrs['whatsapp_referral'].blank?
       end
-
       return
     end
 
@@ -167,11 +148,7 @@ class Whatsapp::IncomingMessageBaseService
     @message.attachments.new(
       account_id: @message.account_id,
       file_type: file_content_type(message_type),
-      file: {
-        io: attachment_file,
-        filename: attachment_file.original_filename,
-        content_type: attachment_file.content_type
-      }
+      file: { io: attachment_file, filename: attachment_file.original_filename, content_type: attachment_file.content_type }
     )
   end
 
@@ -189,39 +166,31 @@ class Whatsapp::IncomingMessageBaseService
   end
 
   def create_message(message, source_id: nil)
-    content_attrs = outgoing_echo ? { external_echo: true } : {}
-    content_attrs[:in_reply_to_external_id] = @in_reply_to_external_id if @in_reply_to_external_id.present?
-
-    # store referral details on the message as well so they are
-    # available even if the conversation custom_attributes are changed
-    # later. most clients will inspect content_attributes for any
-    # additional metadata.
-    if message[:referral].present?
-      content_attrs[:referral] = message[:referral]
-    end
-
     @message = @conversation.messages.build(
       content: message_content(message),
       account_id: @inbox.account_id,
       inbox_id: @inbox.id,
       message_type: outgoing_echo ? :outgoing : :incoming,
-      # Set status to :delivered for echo messages to prevent SendReplyJob from trying to send them
       status: outgoing_echo ? :delivered : :sent,
       sender: outgoing_echo ? nil : @contact,
       source_id: (source_id || message[:id]).to_s,
-      content_attributes: content_attrs
+      content_attributes: build_content_attributes(message)
     )
   end
 
-  def attach_contact(contact)
-    phones = contact[:phones]
-    phones = [{ phone: 'Phone number is not available' }] if phones.blank?
+  def build_content_attributes(message)
+    attrs = outgoing_echo ? { external_echo: true } : {}
+    attrs[:in_reply_to_external_id] = @in_reply_to_external_id if @in_reply_to_external_id.present?
+    
+    # store referral details on the message as well so they are available
+    attrs[:referral] = message[:referral] if message[:referral].present?
+    attrs
+  end
 
+  def attach_contact(contact)
+    phones = contact[:phones] || [{ phone: 'Phone number is not available' }]
     name_info = contact['name'] || {}
-    contact_meta = {
-      firstName: name_info['first_name'],
-      lastName: name_info['last_name']
-    }.compact
+    contact_meta = { firstName: name_info['first_name'], lastName: name_info['last_name'] }.compact
 
     phones.each do |phone|
       @message.attachments.new(
@@ -237,8 +206,6 @@ class Whatsapp::IncomingMessageBaseService
     profile_name = contact_params.dig(:profile, :name)
     return if profile_name.blank?
     return if @contact.name == profile_name
-
-    # Only update if current name exactly matches the phone number or formatted phone number
     return unless contact_name_matches_phone_number?
 
     @contact.update!(name: profile_name)
